@@ -1,0 +1,408 @@
+<?php
+
+declare(strict_types=1);
+
+namespace app\common\util;
+
+use DateTimeInterface;
+
+/**
+ * 通用格式化帮助类。
+ *
+ * 集中处理金额、时间、JSON、映射文案和脱敏逻辑，避免各服务层重复实现。
+ */
+class FormatHelper
+{
+    /**
+     * 金额格式化，单位为元。
+     *
+     * @param int $amount 金额（分）
+     * @return string 格式化后的金额字符串
+     */
+    public static function amount(int $amount): string
+    {
+        return bcdiv((string) $amount, '100', 2);
+    }
+
+    /**
+     * 金额格式化，0 时显示不限。
+     *
+     * @param int $amount 金额（分）
+     * @return string 格式化后的金额字符串
+     */
+    public static function amountOrUnlimited(int $amount): string
+    {
+        return $amount > 0 ? self::amount($amount) : '不限';
+    }
+
+    /**
+     * 次数格式化，0 时显示不限。
+     *
+     * @param int $count 次数
+     * @return string 格式化后的次数字符串
+     */
+    public static function countOrUnlimited(int $count): string
+    {
+        return $count > 0 ? (string) $count : '不限';
+    }
+
+    /**
+     * 费率格式化，单位为百分点。
+     *
+     * @param int $basisPoints 基点值
+     * @return string 格式化后的费率字符串
+     */
+    public static function rate(int $basisPoints): string
+    {
+        return number_format($basisPoints / 100, 2, '.', '') . '%';
+    }
+
+    /**
+     * 延迟格式化。
+     *
+     * @param int $latencyMs 延迟毫秒数
+     * @return string 格式化后的延迟字符串
+     */
+    public static function latency(int $latencyMs): string
+    {
+        return $latencyMs > 0 ? $latencyMs . ' ms' : '0 ms';
+    }
+
+    /**
+     * 日期格式化。
+     *
+     * @param mixed $value 日期值
+     * @param string $emptyText 为空时显示文案
+     * @return string 格式化后的日期字符串
+     */
+    public static function date(mixed $value, string $emptyText = ''): string
+    {
+        return self::formatTemporalValue($value, 'Y-m-d', $emptyText);
+    }
+
+    /**
+     * 日期时间格式化。
+     *
+     * @param mixed $value 日期时间值
+     * @param string $emptyText 为空时显示文案
+     * @return string 格式化后的日期时间字符串
+     */
+    public static function dateTime(mixed $value, string $emptyText = ''): string
+    {
+        return self::formatTemporalValue($value, 'Y-m-d H:i:s', $emptyText);
+    }
+
+    /**
+     * 按时间戳格式化。
+     *
+     * @param int $timestamp Unix 时间戳
+     * @param string $pattern 输出格式
+     * @param string $emptyText 为空时显示文案
+     * @return string 格式化后的时间字符串
+     */
+    public static function timestamp(int $timestamp, string $pattern = 'Y-m-d H:i:s', string $emptyText = ''): string
+    {
+        if ($timestamp <= 0) {
+            return $emptyText;
+        }
+
+        return date($pattern, $timestamp);
+    }
+
+    /**
+     * JSON 文本格式化。
+     *
+     * @param mixed $value JSON 值
+     * @param string $emptyText 为空时显示文案
+     * @return string 格式化后的 JSON 文本
+     */
+    public static function json(mixed $value, string $emptyText = ''): string
+    {
+        if ($value === null || $value === '' || $value === []) {
+            return $emptyText;
+        }
+
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $encoded = json_encode($decoded, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+                return $encoded !== false ? $encoded : $emptyText;
+            }
+
+            return $value;
+        }
+
+        $encoded = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+        return $encoded !== false ? $encoded : $emptyText;
+    }
+
+    /**
+     * 映射表文本转换。
+     *
+     * @param int $value 待映射值
+     * @param array<int, string> $map 映射表
+     * @param string $default 默认值
+     * @return string 映射后的文本
+     */
+    public static function textFromMap(int $value, array $map, string $default = '未知'): string
+    {
+        return (string) ($map[$value] ?? $default);
+    }
+
+    /**
+     * 接口凭证明文脱敏。
+     *
+     * @param string $credentialValue 凭证原文
+     * @param bool $maskShortValue 是否对短值也进行脱敏
+     * @return string 脱敏后的文本
+     */
+    public static function maskCredentialValue(string $credentialValue, bool $maskShortValue = true): string
+    {
+        $credentialValue = trim($credentialValue);
+        if ($credentialValue === '') {
+            return '';
+        }
+
+        $length = strlen($credentialValue);
+        if ($length <= 8) {
+            return $maskShortValue ? str_repeat('*', $length) : $credentialValue;
+        }
+
+        return substr($credentialValue, 0, 4) . '****' . substr($credentialValue, -4);
+    }
+
+    /**
+     * 递归脱敏数组中的敏感字段。
+     *
+     * @param mixed $value 原始值
+     * @return mixed 脱敏后的值
+     */
+    public static function maskSensitiveData(mixed $value): mixed
+    {
+        if (!is_array($value)) {
+            return $value;
+        }
+
+        $masked = [];
+        foreach ($value as $key => $item) {
+            $keyText = strtolower((string) $key);
+            if (in_array($keyText, ['req', 'response'], true)) {
+                $masked[$key] = self::maskStructuredPayload($item);
+                continue;
+            }
+            if (self::isSensitiveKey($keyText)) {
+                $masked[$key] = is_scalar($item) ? self::maskCredentialValue((string) $item) : '****';
+                continue;
+            }
+
+            $masked[$key] = is_array($item) ? self::maskSensitiveData($item) : $item;
+        }
+
+        return $masked;
+    }
+
+    /**
+     * 解析常见渠道报文后按字段脱敏；无法解析的密文只保留摘要。
+     *
+     * @param mixed $payload 原始渠道报文
+     * @return mixed 脱敏后的结构或摘要
+     */
+    private static function maskStructuredPayload(mixed $payload): mixed
+    {
+        if (is_array($payload)) {
+            return self::maskSensitiveData($payload);
+        }
+        if (!is_scalar($payload)) {
+            return ['opaque' => true, 'length' => 0];
+        }
+
+        $original = trim((string) $payload);
+        if ($original === '') {
+            return '';
+        }
+
+        $decoded = $original;
+        for ($index = 0; $index < 2; $index++) {
+            $next = rawurldecode($decoded);
+            if ($next === $decoded) {
+                break;
+            }
+            $decoded = $next;
+        }
+
+        $json = json_decode($decoded, true);
+        if (is_array($json)) {
+            return ['format' => 'json', 'data' => self::maskSensitiveData($json)];
+        }
+
+        $xml = self::decodeXmlPayload($decoded);
+        if ($xml !== null) {
+            return ['format' => 'xml', 'data' => self::maskSensitiveData($xml)];
+        }
+
+        if (str_contains($decoded, '=') && str_contains($decoded, '&')) {
+            parse_str($decoded, $form);
+            if (is_array($form) && $form !== []) {
+                return ['format' => 'form', 'data' => self::maskSensitiveData($form)];
+            }
+        }
+
+        return [
+            'opaque' => true,
+            'length' => strlen($original),
+            'sha256' => hash('sha256', $original),
+        ];
+    }
+
+    /**
+     * 尝试把 XML 文本解析为可递归脱敏的数组。
+     *
+     * @param string $payload XML 文本
+     * @return array<string, mixed>|null
+     */
+    private static function decodeXmlPayload(string $payload): ?array
+    {
+        if (!str_starts_with(ltrim($payload), '<')) {
+            return null;
+        }
+
+        $previous = libxml_use_internal_errors(true);
+        try {
+            $xml = simplexml_load_string($payload, \SimpleXMLElement::class, LIBXML_NONET | LIBXML_NOCDATA);
+            if ($xml === false) {
+                return null;
+            }
+            $json = json_encode($xml, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            $data = is_string($json) ? json_decode($json, true) : null;
+
+            return is_array($data) && $data !== [] && !array_is_list($data) ? $data : null;
+        } finally {
+            libxml_clear_errors();
+            libxml_use_internal_errors($previous);
+        }
+    }
+
+    /**
+     * 将模型或对象归一化成数组。
+     *
+     * @param mixed $value 模型、对象或数组
+     * @return array|null 归一化后的数组
+     */
+    public static function normalizeModel(mixed $value): ?array
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        if (is_array($value)) {
+            return $value;
+        }
+
+        if (is_object($value)) {
+            if (method_exists($value, 'toArray')) {
+                $data = $value->toArray();
+                return is_array($data) ? $data : null;
+            }
+
+            $json = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            if ($json === false) {
+                return null;
+            }
+
+            $data = json_decode($json, true);
+            return is_array($data) ? $data : null;
+        }
+
+        return null;
+    }
+
+    /**
+     * 统一格式化时间值。
+     *
+     * @param mixed $value 时间值
+     * @param string $pattern 输出格式
+     * @param string $emptyText 为空时显示文案
+     * @return string 格式化后的时间文本
+     */
+    private static function formatTemporalValue(mixed $value, string $pattern, string $emptyText): string
+    {
+        if ($value === null || $value === '') {
+            return $emptyText;
+        }
+
+        if (is_string($value)) {
+            $text = trim($value);
+            return $text === '' ? $emptyText : $text;
+        }
+
+        if ($value instanceof DateTimeInterface) {
+            return $value->format($pattern);
+        }
+
+        if (is_object($value) && method_exists($value, 'format')) {
+            return $value->format($pattern);
+        }
+
+        return (string) $value;
+    }
+
+    /**
+     * 判断字段名是否属于敏感字段。
+     *
+     * @param string $key 字段名
+     * @return bool 是否敏感
+     */
+    private static function isSensitiveKey(string $key): bool
+    {
+        if ($key === '') {
+            return false;
+        }
+
+        if (in_array($key, [
+            'sign',
+            'signature',
+            'authorization',
+            'auth_code',
+            'alipay_auth_code',
+            'wx_login_code',
+            'mini_code',
+            'session_key',
+            'unionpay_auth_code',
+            'userauthcode',
+            'openid',
+            'wx_openid',
+            'sub_openid',
+            'mini_openid',
+            'unionid',
+            'buyer_id',
+            'buyer_open_id',
+            'user_id',
+            'unionpay_user_id',
+        ], true)) {
+            return true;
+        }
+
+        foreach ([
+            'password',
+            'passwd',
+            'secret',
+            'token',
+            'access_key',
+            'api_key',
+            'app_key',
+            'appkey',
+            'private_key',
+            'merchant_private_key',
+            'platform_private_key',
+            'cert_password',
+            'aes_key',
+            'mch_key',
+        ] as $pattern) {
+            if ($key === $pattern || str_contains($key, $pattern)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}

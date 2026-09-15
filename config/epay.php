@@ -1,0 +1,17 @@
+<?php
+
+use app\common\util\EpayPlatformKeyFile;
+
+return [
+    'charset' => 'UTF-8',
+    'v1' => [
+        'sign_type' => 'MD5',
+    ],
+    'v2' => [
+        'sign_type' => 'RSA',
+        'timestamp_ttl' => 300,
+        'transfer_rate' => '0.01',
+        'platform_private_key' => EpayPlatformKeyFile::privateKey(),
+        'platform_public_key' => EpayPlatformKeyFile::publicKey(),
+    ],
+];

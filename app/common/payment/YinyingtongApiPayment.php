@@ -1,0 +1,450 @@
+<?php
+
+declare(strict_types=1);
+
+namespace app\common\payment;
+
+use app\common\base\BasePayment;
+use app\common\constant\PaymentPluginTypeConstant;
+use app\common\constant\PaymentPluginStatusConstant;
+use app\common\interface\PaymentInterface;
+use app\common\interface\PayPluginInterface;
+use app\common\sdk\yinyingtong\YinyingtongClient;
+use app\common\sdk\yinyingtong\YinyingtongSdkException;
+use app\common\trait\DirectPaymentProductSelectorTrait;
+use app\common\util\FormatHelper;
+use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
+use support\Request;
+use support\Response;
+
+/**
+ * 银盈通支付 API 插件。
+ *
+ * 负责支付宝/微信预下单、微信小程序 Scheme、银行卡快捷支付、退款和两种格式的异步通知适配。
+ * 当前协议未接入可确认的主动查单与关单能力。
+ */
+class YinyingtongApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface
+{
+    use DirectPaymentProductSelectorTrait;
+
+    private const PRODUCT_ALIPAY_ORDER = 'alipay_order';
+    private const PRODUCT_WX_PUBLIC_ORDER = 'wx_public_order';
+    private const PRODUCT_WX_MINI = 'wx_mini';
+    private const PRODUCT_QUICK_PAY = 'quick_pay';
+
+    private ?YinyingtongClient $client = null;
+
+    /**
+     * 插件元信息。
+     *
+     * @var array<string, mixed>
+     */
+    protected array $paymentInfo = [
+        'code' => 'yinyingtong_api',
+        'name' => '银盈通支付API',
+        'plugin_type' => PaymentPluginTypeConstant::TYPE_DIRECT,
+        'author' => 'MPAY',
+        'link' => 'http://www.yinyingtong.com/',
+        'version' => '1.0.0',
+        'pay_types' => ['alipay', 'wxpay', 'bank'],
+        'transfer_types' => [],
+        'config_schema' => [],
+    ];
+
+    /**
+     * 获取后台配置表单。
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function getConfigSchema(): array
+    {
+        return [
+            ['type' => 'input', 'field' => 'app_id', 'title' => '应用ID', 'value' => '', 'validate' => [['required' => true, 'message' => '应用ID不能为空']]],
+            ['type' => 'password', 'field' => 'app_key', 'title' => '应用KEY', 'value' => '', 'validate' => [['required' => true, 'message' => '应用KEY不能为空']]],
+            ['type' => 'password', 'field' => 'product_key', 'title' => '产品密钥', 'value' => '', 'validate' => [['required' => true, 'message' => '产品密钥不能为空']]],
+            ['type' => 'input', 'field' => 'merchant_number', 'title' => '交易商户企业号', 'value' => '', 'validate' => [['required' => true, 'message' => '交易商户企业号不能为空']]],
+            ['type' => 'input', 'field' => 'trade_platform_no', 'title' => '平台商企业号', 'value' => '', 'validate' => [['required' => true, 'message' => '平台商企业号不能为空']]],
+            ['type' => 'input', 'field' => 'channel_merch_no', 'title' => '渠道商户号', 'value' => ''],
+            $this->directPaymentEnabledProductsField([
+                self::PRODUCT_ALIPAY_ORDER => '支付宝预下单',
+                self::PRODUCT_WX_PUBLIC_ORDER => '微信预下单',
+                self::PRODUCT_WX_MINI => '微信小程序/Scheme',
+                self::PRODUCT_QUICK_PAY => '银行卡快捷支付',
+            ]),
+        ];
+    }
+
+    /**
+     * 发起支付。
+     *
+     * @param array<string, mixed> $order 标准插件下单参数
+     *
+     * @return array<string, mixed> 标准待支付结果
+     */
+    public function pay(array $order): array
+    {
+        $payType = (string) $order['pay_type_code'];
+
+        return $this->executeDirectPaymentProduct($order, [
+            'h5' => [
+                'products' => [
+                    'alipay' => self::PRODUCT_ALIPAY_ORDER,
+                    'wxpay' => self::PRODUCT_WX_PUBLIC_ORDER,
+                    'bank' => self::PRODUCT_QUICK_PAY,
+                ],
+                'handler' => fn (): array => $payType === 'bank' ? $this->quickPay($order) : $this->prepayPay($order, $payType, 'jump'),
+            ],
+
+            'jump' => [
+                'products' => [
+                    'alipay' => self::PRODUCT_ALIPAY_ORDER,
+                    'wxpay' => self::PRODUCT_WX_PUBLIC_ORDER,
+                    'bank' => self::PRODUCT_QUICK_PAY,
+                ],
+                'handler' => fn (): array => $payType === 'bank' ? $this->quickPay($order) : $this->prepayPay($order, $payType, 'jump'),
+            ],
+
+            'web' => [
+                'products' => [
+                    'alipay' => self::PRODUCT_ALIPAY_ORDER,
+                    'wxpay' => self::PRODUCT_WX_PUBLIC_ORDER,
+                    'bank' => self::PRODUCT_QUICK_PAY,
+                ],
+                'handler' => fn (): array => $payType === 'bank' ? $this->quickPay($order) : $this->prepayPay($order, $payType, 'jump'),
+            ],
+
+            'urlscheme' => [
+                'products' => [
+                    'wxpay' => self::PRODUCT_WX_MINI,
+                ],
+                'handler' => fn (): array => $payType === 'wxpay'
+                ? $this->wxUrlSchemePay($order)
+                : throw new PaymentException('银盈通当前支付方式不支持URL Scheme产品', 40200, ['channel_error_code' => 'PRODUCT_NOT_OPEN']),
+            ],
+
+            'qrcode' => [
+                'products' => [
+                    'alipay' => self::PRODUCT_ALIPAY_ORDER,
+                    'wxpay' => self::PRODUCT_WX_PUBLIC_ORDER,
+                    'bank' => self::PRODUCT_QUICK_PAY,
+                ],
+                'handler' => fn (): array => $payType === 'bank' ? $this->quickPay($order) : $this->prepayPay($order, $payType, 'qrcode'),
+            ],
+        ], '银盈通');
+    }
+
+    /**
+     * 预下单并按承接页类型返回。
+     *
+     * @param array<string, mixed> $order 标准插件下单参数
+     * @param string $payType 标准支付方式代码
+     * @param string $payPage 承接页类型
+     *
+     * @return array<string, mixed> 标准跳转或二维码待支付结果
+     */
+    private function prepayPay(array $order, string $payType, string $payPage): array
+    {
+        $prepay = $this->prepay($order, $payType === 'wxpay' ? '02' : '01', $payType === 'wxpay' ? '16' : '');
+        $orderId = (string) ($prepay['order_id'] ?? '');
+        if ($orderId === '') {
+            throw new PaymentException('银盈通未返回预下单号', 40200, ['response' => $prepay]);
+        }
+
+        $url = $payType === 'wxpay'
+            ? 'https://h5.gomepay.com/cashier-h5/index.html#/pages/preOrder/wxPublicOrder?orderId=' . rawurlencode($orderId) . '&showPayButton=0'
+            : 'https://h5.gomepay.com/cashier-h5/index.html#/pages/preOrder/orderPay?orderId=' . rawurlencode($orderId) . '&showPayButton=0';
+
+        $payParams = $payPage === 'jump'
+            ? ['url' => $url, 'raw' => $prepay]
+            : ['qrcode' => $url, 'raw' => $prepay];
+
+        return $this->payResult($payPage, $payType, $payType === 'wxpay' ? 'wx_public_order' : 'alipay_order', 'gepos.pre.pay', $payParams, $prepay, $order);
+    }
+
+    /**
+     * 当前适配协议未提供可确认的主动查单接口。
+     *
+     * @param array<string, mixed> $order 标准插件查单参数
+     * @return array<string, mixed>
+     */
+    public function query(array $order): array
+    {
+        throw new UnsupportedPaymentOperationException('银盈通插件暂不支持主动查单', 40200);
+    }
+
+    /**
+     * 当前适配协议未提供可确认的关单接口。
+     *
+     * @param array<string, mixed> $order 标准插件关单参数
+     * @return array<string, mixed>
+     */
+    public function close(array $order): array
+    {
+        throw new UnsupportedPaymentOperationException('银盈通插件暂不支持关单', 40200);
+    }
+
+    /**
+     * 申请退款。
+     *
+     * @param array<string, mixed> $order 标准插件退款参数
+     * @return array<string, mixed>
+     */
+    public function refund(array $order): array
+    {
+        try {
+            $data = $this->client()->execute('gepos.refund', [
+                'scene' => '0606',
+                'merchant_number' => $this->configText('merchant_number'),
+                'order_number' => (string) $order['refund_no'],
+                'old_order_number' => (string) $order['pay_no'],
+                'old_order_id' => (string) ($order['chan_trade_no'] ?? ''),
+                'amount' => FormatHelper::amount((int) $order['refund_amount']),
+                'currency' => 'CNY',
+                'async_notification_addr' => (string) ($order['refund_callback_url'] ?? ''),
+                'memo' => '订单退款',
+            ], (string) ($order['client_ip'] ?? ''), (string) ($order['_env'] ?? 'pc'));
+        } catch (YinyingtongSdkException $e) {
+            throw new PaymentUncertainException('银盈通退款结果不确定：' . $e->getMessage(), 40200);
+        }
+
+        return [
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
+            'refund_amount' => (int) $order['refund_amount'],
+            'chan_refund_no' => (string) ($data['order_id'] ?? ''),
+            'message' => '退款申请成功',
+        ];
+    }
+
+    /**
+     * 解析支付回调。
+     *
+     * 兼容签名 JSON 与 dstbdatasign 加密通知：前者验签后解析 data，后者通过 SDK 解密后再归一化状态。
+     *
+     * @param Request $request 回调请求
+     *
+     * @return array<string, mixed> 标准支付通知结果
+     */
+    public function notify(Request $request): array
+    {
+        $encrypted = (string) ($request->post('dstbdatasign') ?? '');
+        if ($encrypted === '') {
+            $payload = json_decode((string) $request->rawBody(), true);
+            if (!is_array($payload) || !$this->client()->verify($payload)) {
+                throw new PaymentException('银盈通回调验签失败', 40200);
+            }
+            $data = json_decode((string) ($payload['data'] ?? '{}'), true);
+            if (!is_array($data)) {
+                throw new PaymentException('银盈通回调内容不是合法 JSON', 40200);
+            }
+        } else {
+            try {
+                $data = $this->client()->decryptNotify($encrypted);
+            } catch (YinyingtongSdkException $e) {
+                throw new PaymentException('银盈通回调解密失败：' . $e->getMessage(), 40200);
+            }
+        }
+
+        $status = (string) ($data['orderstatus'] ?? $data['status'] ?? '');
+        $success = in_array($status, ['00', 'SUCCESS'], true);
+        $payNo = isset($data['dsorderid']) ? (string) $data['dsorderid'] : (string) ($data['order_number'] ?? '');
+        $amount = isset($data['amount']) ? $data['amount'] : ($data['total_amount'] ?? null);
+
+        return [
+            'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::FAILED,
+            'pay_no' => trim($payNo),
+            'paid_amount' => $success ? $this->yuanToCents($amount, '银盈通回调金额') : null,
+            'message' => $status,
+            'chan_order_no' => (string) ($data['dsorderid'] ?? $data['order_number'] ?? ''),
+            'chan_trade_no' => (string) ($data['orderid'] ?? $data['order_id'] ?? ''),
+            'channel_status' => $status,
+        ];
+    }
+
+    /**
+     * 返回银盈通成功应答。
+     */
+    public function notifySuccess(): string|Response
+    {
+        return '00';
+    }
+
+    /**
+     * 返回银盈通失败应答。
+     */
+    public function notifyFail(): string|Response
+    {
+        return '01';
+    }
+
+    /**
+     * 将渠道元金额严格换算为分，拒绝负数及超过两位的小数。
+     *
+     * @param mixed $value 渠道元金额原值
+     * @param string $field 用于异常提示的字段名称
+     */
+    private function yuanToCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/', $text, $matches) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return ((int) $matches[1] * 100) + (int) str_pad((string) ($matches[2] ?? ''), 2, '0');
+    }
+
+    /**
+     * 微信小程序 URL Scheme 支付。
+     *
+     * @param array<string, mixed> $order 标准插件下单参数
+     * @return array<string, mixed>
+     */
+    private function wxUrlSchemePay(array $order): array
+    {
+        $prepay = $this->prepay($order, '02', '22');
+        $orderId = (string) ($prepay['order_id'] ?? '');
+        if ($orderId === '') {
+            throw new PaymentException('银盈通未返回预下单号', 40200, ['response' => $prepay]);
+        }
+
+        $query = 'orderId=' . rawurlencode($orderId) . '&showPayButton=0';
+        $urlScheme = 'weixin://dl/business/?appid=wx135edf7e3c7a1e7d&path=pages/wechat/preOrder/orderpay&query=' . rawurlencode($query) . '&env_version=release';
+
+        return $this->payResult('urlscheme', 'wxpay', 'wx_mini', 'gepos.pre.pay', ['urlscheme' => $urlScheme, 'raw' => $prepay], $prepay, $order);
+    }
+
+    /**
+     * 快捷支付。
+     *
+     * @param array<string, mixed> $order 标准插件下单参数
+     * @return array<string, mixed>
+     */
+    private function quickPay(array $order): array
+    {
+        $userId = substr((string) $order['pay_no'], -16);
+        try {
+            $data = $this->client()->execute('gcash.trade.precreate', [
+                'merchant_number' => $this->configText('merchant_number'),
+                'order_number' => (string) $order['pay_no'],
+                'scene' => '14',
+                'good_desc' => mb_strcut((string) $order['subject'], 0, 127, 'UTF-8'),
+                'total_amount' => FormatHelper::amount((int) $order['amount']),
+                'currency' => 'cny',
+                'user_id' => $userId,
+                'notify_url' => (string) $order['callback_url'],
+                'return_url' => (string) $order['return_url'],
+            ], (string) $order['client_ip'], (string) ($order['_env'] ?? 'pc'));
+        } catch (YinyingtongSdkException $e) {
+            throw new PaymentException('银盈通快捷支付下单失败：' . $e->getMessage(), 40200);
+        }
+
+        $url = 'https://h5.gomepay.com/cashier-h5/index.html#/pages/paymentB/cashRegister?' . http_build_query([
+            'merchant_number' => $this->configText('merchant_number'),
+            'user_id' => $userId,
+            'order_number' => (string) $order['pay_no'],
+            'type' => 'wbsh',
+        ]);
+
+        return $this->payResult('jump', 'bank', 'quick_pay', 'gcash.trade.precreate', ['url' => $url, 'raw' => $data], $data, $order);
+    }
+
+    /**
+     * 支付预下单。
+     *
+     * @param array<string, mixed> $order 标准插件下单参数
+     * @param string $payType 银盈通支付类型
+     * @param string $bankServiceType 银行服务类型；无需该字段时传空字符串
+     *
+     * @return array<string, mixed> 上游预下单响应
+     */
+    private function prepay(array $order, string $payType, string $bankServiceType): array
+    {
+        try {
+            return $this->client()->execute('gepos.pre.pay', array_filter([
+                'merchant_number' => $this->configText('merchant_number'),
+                'order_number' => (string) $order['pay_no'],
+                'amount' => FormatHelper::amount((int) $order['amount']),
+                'pay_type' => $payType,
+                'currency' => 'CNY',
+                'order_title' => mb_strcut((string) $order['subject'], 0, 127, 'UTF-8'),
+                'channel_code' => $payType,
+                'async_notification_addr' => (string) $order['callback_url'],
+                'notify_key_mode' => '03',
+                'ref_no' => $this->configText('trade_platform_no'),
+                'bank_service_type' => $bankServiceType,
+                'bank_mch_id' => $this->channelMerchantNo(),
+            ], static fn (mixed $value): bool => $value !== '' && $value !== null), (string) $order['client_ip'], (string) ($order['_env'] ?? 'pc'));
+        } catch (YinyingtongSdkException $e) {
+            throw new PaymentException('银盈通预下单失败：' . $e->getMessage(), 40200);
+        }
+    }
+
+    /**
+     * 将上游支付凭据包装为标准待支付结果。
+     *
+     * @param string $page 收银台承接页类型
+     * @param string $payType 标准支付方式代码
+     * @param string $product 银盈通产品代码
+     * @param string $action 实际调用的上游接口
+     * @param array<string, mixed> $payParams 承接页参数
+     * @param array<string, mixed> $data 上游响应
+     * @param array<string, mixed> $order 标准插件下单参数
+     *
+     * @return array<string, mixed> 标准待支付结果
+     */
+    private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
+    {
+        return $this->pendingPaymentResult($order, [
+            'pay_page' => $page,
+            'pay_type' => $payType,
+            'pay_product' => $product,
+            'pay_action' => $action,
+            'pay_params' => $payParams,
+            'chan_order_no' => (string) ($data['order_number'] ?? $order['pay_no']),
+            'chan_trade_no' => (string) ($data['order_id'] ?? ''),
+        ]);
+    }
+
+    /**
+     * 从逗号分隔的渠道商户号中随机选择一个值。
+     */
+    private function channelMerchantNo(): string
+    {
+        $value = $this->configText('channel_merch_no');
+        if (!str_contains($value, ',')) {
+            return $value;
+        }
+
+        $items = array_values(array_filter(array_map('trim', explode(',', $value))));
+        return $items === [] ? '' : (string) $items[array_rand($items)];
+    }
+
+    /**
+     * 获取按应用和产品密钥初始化的 SDK 客户端。
+     */
+    private function client(): YinyingtongClient
+    {
+        if ($this->client === null) {
+            $this->client = new YinyingtongClient([
+                'app_id' => $this->configText('app_id'),
+                'app_key' => $this->configText('app_key'),
+                'product_key' => $this->configText('product_key'),
+            ]);
+        }
+
+        return $this->client;
+    }
+
+    /**
+     * 读取字符串配置，缺失时返回空字符串。
+     *
+     * @param string $key 配置键
+     */
+    private function configText(string $key): string
+    {
+        return (string) $this->getConfig($key, '');
+    }
+}

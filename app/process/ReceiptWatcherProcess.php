@@ -1,0 +1,249 @@
+<?php
+
+namespace app\process;
+
+use app\service\payment\receipt\ReceiptWatcherService;
+use app\service\system\ops\SystemOpsHeartbeatService;
+use support\Log;
+use Workerman\Timer;
+use Workerman\Worker;
+
+/**
+ * 网页流水监听调度进程。
+ *
+ * 该进程不访问第三方平台，只维护账号、订单快照、查询/预登录到期表，
+ * 再按支付插件声明把任务投放到四条 v2 Redis Stream。
+ */
+class ReceiptWatcherProcess
+{
+    /**
+     * 上次执行时间。
+     *
+     * @var array<string, int>
+     */
+    private array $lastRunAt = [];
+
+    /**
+     * 运行锁。
+     *
+     * @var array<string, bool>
+     */
+    private array $running = [];
+
+    /**
+     * 构造方法。
+     *
+     * @param array<string, mixed> $options 进程选项
+     */
+    public function __construct(
+        private array $options = []
+    ) {
+    }
+
+    /**
+     * 进程启动后初始化账号缓存和调度定时器。
+     *
+     * @param Worker $worker Workerman 进程实例
+     * @return void
+     */
+    public function onWorkerStart(Worker $worker): void
+    {
+        try {
+            $this->watcherService()->refreshChannelCache();
+        } catch (\Throwable $e) {
+            Log::warning('[ReceiptWatcherProcess] 启动刷新账号缓存失败：' . $e->getMessage());
+        }
+
+        $heartbeat = $this->intOption('heartbeat_seconds', 1, 1, 60);
+        // 启动时先写一次心跳，避免监控页在首次 Timer tick 前显示“未上报”。
+        $this->reportHeartbeat([
+            'summary' => '网页流水监听调度进程已启动',
+            'heartbeat_seconds' => $heartbeat,
+        ]);
+        Timer::add($heartbeat, function (): void {
+            $this->tick();
+        });
+
+        Log::info(sprintf('[ReceiptWatcherProcess] 网页流水监听调度进程已启动 heartbeat=%s', $heartbeat));
+    }
+
+    /**
+     * 心跳调度入口。
+     *
+     * @return void
+     */
+    private function tick(): void
+    {
+        try {
+            $this->reportHeartbeat([
+                'summary' => '网页流水监听调度中',
+            ]);
+
+            $this->runIfDue('refresh_channels', 60, function (): array {
+                return $this->watcherService()->refreshChannelCache();
+            });
+
+            $this->runIfDue('sync_pending_orders', $this->scanIntervalSeconds(), function (): array {
+                return $this->watcherService()->syncPendingOrders($this->scanBatchSize());
+            });
+
+            $this->runIfDue('dispatch_due_accounts', 1, function (): array {
+                return $this->watcherService()->dispatchDueAccountTasks($this->scanBatchSize());
+            });
+
+            $this->runIfDue('dispatch_due_prelogin_accounts', 1, function (): array {
+                return $this->watcherService()->dispatchDuePreloginAccountTasks($this->scanBatchSize());
+            });
+        } catch (\Throwable $e) {
+            $this->reportHeartbeat([
+                'summary' => '网页流水监听调度异常',
+                'last_error' => $e->getMessage(),
+            ]);
+            Log::warning('[ReceiptWatcherProcess] 心跳调度失败：' . $e->getMessage());
+        }
+    }
+
+    /**
+     * 到期后执行任务。
+     *
+     * @param string $key 任务键
+     * @param int $intervalSeconds 间隔秒数
+     * @param callable $callback 任务回调
+     * @return void
+     */
+    private function runIfDue(string $key, int $intervalSeconds, callable $callback): void
+    {
+        $now = time();
+        $lastRunAt = (int) ($this->lastRunAt[$key] ?? 0);
+        if ($lastRunAt > 0 && $now - $lastRunAt < $intervalSeconds) {
+            return;
+        }
+        if (!empty($this->running[$key])) {
+            return;
+        }
+
+        $this->lastRunAt[$key] = $now;
+        $this->running[$key] = true;
+
+        try {
+            $summary = $callback();
+            $this->reportHeartbeat([
+                'summary' => $key . ' 执行完成',
+                'current_task' => $key,
+                'task_summary' => $summary,
+            ]);
+            if ($this->shouldLogSummary($key, $summary)) {
+                Log::info(sprintf(
+                    '[ReceiptWatcherProcess] %s 执行完成 %s',
+                    $key,
+                    $this->summaryText($summary)
+                ));
+            }
+        } catch (\Throwable $e) {
+            $this->reportHeartbeat([
+                'summary' => $key . ' 执行失败',
+                'current_task' => $key,
+                'last_error' => $e->getMessage(),
+            ]);
+            Log::warning(sprintf('[ReceiptWatcherProcess] %s 执行失败：%s', $key, $e->getMessage()));
+        } finally {
+            $this->running[$key] = false;
+        }
+    }
+
+    /**
+     * 判断是否需要记录执行摘要。
+     *
+     * 账号缓存刷新、到期扫描、锁竞争和重复投递都是正常调度，不写文件日志。
+     * 只有同步到待支付订单、成功投递任务或清理失效任务时才记录摘要。
+     *
+     * @param string $key 任务键
+     * @param array<string, int> $summary 任务摘要
+     * @return bool 是否记录日志
+     */
+    private function shouldLogSummary(string $key, array $summary): bool
+    {
+        return match ($key) {
+            'sync_pending_orders' => (int) ($summary['orders'] ?? 0) > 0,
+            'dispatch_due_accounts', 'dispatch_due_prelogin_accounts' =>
+                (int) ($summary['queued'] ?? 0) > 0 || (int) ($summary['stale'] ?? 0) > 0,
+            default => false,
+        };
+    }
+
+    /**
+     * 将任务摘要编码为日志文本。
+     *
+     * @param array<string, int> $summary 任务摘要
+     * @return string JSON 文本
+     */
+    private function summaryText(array $summary): string
+    {
+        return json_encode($summary, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '{}';
+    }
+
+    /**
+     * 读取待支付订单扫描间隔。
+     *
+     * @return int 待支付订单扫描间隔
+     */
+    private function scanIntervalSeconds(): int
+    {
+        return max(2, (int) sys_config('receipt_watcher_order_scan_interval_seconds', 3));
+    }
+
+    /**
+     * 读取待支付订单扫描批量。
+     *
+     * @return int 待支付订单扫描批量
+     */
+    private function scanBatchSize(): int
+    {
+        return max(1, (int) sys_config('receipt_watcher_order_scan_batch_size', 500));
+    }
+
+    /**
+     * 读取并约束进程选项中的整数配置。
+     *
+     * @param string $key 配置键
+     * @param int $default 默认值
+     * @param int $min 最小值
+     * @param int $max 最大值
+     * @return int 配置值
+     */
+    private function intOption(string $key, int $default, int $min, int $max): int
+    {
+        $value = (int) ($this->options[$key] ?? $default);
+
+        return min($max, max($min, $value));
+    }
+
+    /**
+     * 获取网页流水监听服务。
+     *
+     * @return ReceiptWatcherService 网页流水监听服务
+     */
+    private function watcherService(): ReceiptWatcherService
+    {
+        return container_get(ReceiptWatcherService::class);
+    }
+
+    /**
+     * 上报运维心跳。
+     *
+     * 心跳只服务管理后台运行监控，失败不能影响网页流水监听任务同步。
+     *
+     * @param array<string, mixed> $payload 心跳内容
+     * @return void
+     */
+    private function reportHeartbeat(array $payload): void
+    {
+        try {
+            /** @var SystemOpsHeartbeatService $service */
+            $service = container_get(SystemOpsHeartbeatService::class);
+            $service->report('receipt-watcher', $payload);
+        } catch (\Throwable) {
+            // 监控写入失败时静默降级，监听调度继续运行。
+        }
+    }
+}

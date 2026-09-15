@@ -1,0 +1,23 @@
+# Runtime / secrets
+.env
+/data/*
+!/data/.gitkeep
+/runtime/*
+*.log
+epay-platform-private.pem
+epay-platform-public.pem
+
+# Dependencies / IDE
+/vendor/
+/.idea/
+/.vscode/
+
+# User uploads only; compiled frontend assets under public/ are part of this repository.
+/public/storage/*
+!/public/storage/.gitkeep
+
+# Backups / release archives
+/backups/
+*.zip
+*.tar
+*.tar.gz

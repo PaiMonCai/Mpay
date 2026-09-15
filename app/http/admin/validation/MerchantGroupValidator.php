@@ -1,0 +1,106 @@
+<?php
+
+namespace app\http\admin\validation;
+
+use support\validation\Validator;
+
+/**
+ * 商户分组参数校验器。
+ *
+ * 用于校验商户分组的查询和增删改参数。
+ */
+class MerchantGroupValidator extends Validator
+{
+    /**
+     * 校验规则
+     *
+     * @var array
+     */
+    protected array $rules = [
+        'id' => 'sometimes|integer|min:1',
+        'keyword' => 'sometimes|string|max:128',
+        'group_name' => 'sometimes|string|max:100',
+        'status' => 'sometimes|integer|in:0,1',
+        'remark' => 'nullable|string|max:500',
+        'page' => 'sometimes|integer|min:1',
+        'page_size' => 'sometimes|integer|min:1|max:100',
+    ];
+
+    /**
+     * 字段别名
+     *
+     * @var array
+     */
+    protected array $attributes = [
+        'id' => '分组ID',
+        'keyword' => '关键字',
+        'group_name' => '分组名称',
+        'status' => '分组状态',
+        'remark' => '备注',
+        'page' => '页码',
+        'page_size' => '每页条数',
+    ];
+
+    /**
+     * 校验场景
+     *
+     * @var array
+     */
+    protected array $scenes = [
+        'index' => ['keyword', 'group_name', 'status', 'page', 'page_size'],
+        'store' => ['group_name', 'status', 'remark'],
+        'update' => ['id', 'group_name', 'status', 'remark'],
+        'show' => ['id'],
+        'destroy' => ['id'],
+    ];
+
+    /**
+     * 配置新增商户分组场景规则。
+     *
+     * @return static 校验器实例
+     */
+    public function sceneStore(): static
+    {
+        return $this->appendRules([
+            'group_name' => 'required|string|max:100',
+        ]);
+    }
+
+    /**
+     * 配置更新商户分组场景规则。
+     *
+     * @return static 校验器实例
+     */
+    public function sceneUpdate(): static
+    {
+        return $this->appendRules([
+            'id' => 'required|integer|min:1',
+            'group_name' => 'required|string|max:100',
+        ]);
+    }
+
+    /**
+     * 配置商户分组详情场景规则。
+     *
+     * @return static 校验器实例
+     */
+    public function sceneShow(): static
+    {
+        return $this->appendRules([
+            'id' => 'required|integer|min:1',
+        ]);
+    }
+
+    /**
+     * 配置删除商户分组场景规则。
+     *
+     * @return static 校验器实例
+     */
+    public function sceneDestroy(): static
+    {
+        return $this->sceneShow();
+    }
+}
+
+
+

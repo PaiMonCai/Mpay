@@ -1,0 +1,177 @@
+<?php
+
+namespace app\service\ops\log;
+
+use app\common\base\BaseService;
+use app\common\constant\NotifyConstant;
+use app\model\admin\PayCallbackLog;
+use app\repository\ops\log\PayCallbackLogRepository;
+
+/**
+ * 支付回调日志查询服务。
+ *
+ * 负责查询支付与退款回调记录、补充展示字段和还原回调处理状态。
+ *
+ * @property PayCallbackLogRepository $payCallbackLogRepository 支付回调日志仓库
+ */
+class PayCallbackLogService extends BaseService
+{
+    /**
+     * 构造方法。
+     *
+     * @param PayCallbackLogRepository $payCallbackLogRepository 支付回调日志仓库
+     * @return void
+     */
+    public function __construct(
+        protected PayCallbackLogRepository $payCallbackLogRepository
+    ) {
+    }
+
+    /**
+     * 分页查询支付回调日志。
+     *
+     * @param array $filters 筛选条件
+     * @param int $page 页码
+     * @param int $pageSize 每页条数
+     * @return \Illuminate\Contracts\Pagination\LengthAwarePaginator 分页结果
+     */
+    public function paginate(array $filters = [], int $page = 1, int $pageSize = 10)
+    {
+        $query = $this->baseQuery();
+
+        $keyword = trim((string) ($filters['keyword'] ?? ''));
+        if ($keyword !== '') {
+            $query->where(function ($builder) use ($keyword) {
+                $builder->where('l.pay_no', 'like', '%' . $keyword . '%')
+                    ->orWhere('l.refund_no', 'like', '%' . $keyword . '%')
+                    ->orWhere('bo.merchant_order_no', 'like', '%' . $keyword . '%')
+                    ->orWhere('bo.subject', 'like', '%' . $keyword . '%')
+                    ->orWhere('m.merchant_no', 'like', '%' . $keyword . '%')
+                    ->orWhere('m.merchant_name', 'like', '%' . $keyword . '%')
+                    ->orWhere('m.merchant_short_name', 'like', '%' . $keyword . '%')
+                    ->orWhere('g.group_name', 'like', '%' . $keyword . '%')
+                    ->orWhere('c.name', 'like', '%' . $keyword . '%')
+                    ->orWhere('c.plugin_code', 'like', '%' . $keyword . '%');
+            });
+        }
+
+        $merchantId = (string) ($filters['merchant_id'] ?? '');
+        if ($merchantId !== '') {
+            $query->where('p.merchant_id', (int) $merchantId);
+        }
+
+        $channelId = (string) ($filters['channel_id'] ?? '');
+        if ($channelId !== '') {
+            $query->where('l.channel_id', (int) $channelId);
+        }
+
+        $callbackType = (string) ($filters['callback_type'] ?? '');
+        if ($callbackType !== '') {
+            $query->where('l.callback_type', (int) $callbackType);
+        }
+
+        $verifyStatus = (string) ($filters['verify_status'] ?? '');
+        if ($verifyStatus !== '') {
+            $query->where('l.verify_status', (int) $verifyStatus);
+        }
+
+        $processStatus = (string) ($filters['process_status'] ?? '');
+        if ($processStatus !== '') {
+            $query->where('l.process_status', (int) $processStatus);
+        }
+
+        $startTime = trim((string) ($filters['start_time'] ?? ''));
+        if ($startTime !== '') {
+            $query->where('l.created_at', '>=', $startTime);
+        }
+
+        $endTime = trim((string) ($filters['end_time'] ?? ''));
+        if ($endTime !== '') {
+            $query->where('l.created_at', '<', $endTime);
+        }
+
+        $paginator = $query
+            ->orderByDesc('l.id')
+            ->paginate(max(1, $pageSize), ['*'], 'page', max(1, $page));
+
+        $paginator->getCollection()->transform(function ($row) {
+            return $this->decorateRow($row);
+        });
+
+        return $paginator;
+    }
+
+    /**
+     * 按 ID 查询支付回调日志详情。
+     *
+     * @param int $id 支付回调日志ID
+     * @return PayCallbackLog|null 日志模型
+     */
+    public function findById(int $id): ?PayCallbackLog
+    {
+        $row = $this->baseQuery()
+            ->where('l.id', $id)
+            ->first();
+
+        return $row ? $this->decorateRow($row) : null;
+    }
+
+    /**
+     * 格式化单条记录。
+     *
+     * @param object $row 查询结果对象
+     * @return object 格式化后的对象
+     */
+    private function decorateRow(object $row): object
+    {
+        $row->business_type_text = ((string) ($row->refund_no ?? '')) !== '' ? '退款回调' : '支付回调';
+        $row->callback_type_text = (string) (NotifyConstant::callbackTypeMap()[(int) $row->callback_type] ?? '未知');
+        $row->verify_status_text = (string) (NotifyConstant::verifyStatusMap()[(int) $row->verify_status] ?? '未知');
+        $row->process_status_text = (string) (NotifyConstant::processStatusMap()[(int) $row->process_status] ?? '未知');
+        $row->created_at_text = $this->formatDateTime($row->created_at ?? null);
+        $row->request_data_text = $this->formatJson($row->request_data ?? null);
+        $row->process_result_text = $this->formatJson($row->process_result ?? null);
+
+        return $row;
+    }
+
+    /**
+     * 构建基础查询。
+     *
+     * @return \Illuminate\Database\Eloquent\Builder 查询构造器
+     */
+    private function baseQuery()
+    {
+        return $this->payCallbackLogRepository->query()
+            ->from('ma_pay_callback_log as l')
+            ->leftJoin('ma_pay_order as p', 'p.pay_no', '=', 'l.pay_no')
+            ->leftJoin('ma_biz_order as bo', 'bo.biz_no', '=', 'p.biz_no')
+            ->leftJoin('ma_merchant as m', 'm.id', '=', 'p.merchant_id')
+            ->leftJoin('ma_merchant_group as g', 'g.id', '=', 'm.group_id')
+            ->leftJoin('ma_payment_channel as c', 'c.id', '=', 'l.channel_id')
+            ->select([
+                'l.id',
+                'l.pay_no',
+                'l.refund_no',
+                'l.channel_id',
+                'l.callback_type',
+                'l.request_data',
+                'l.request_hash',
+                'l.verify_status',
+                'l.process_status',
+                'l.process_result',
+                'l.created_at',
+                'p.merchant_id',
+                'bo.merchant_order_no',
+                'bo.subject',
+            ])
+            ->selectRaw("COALESCE(m.merchant_no, '') AS merchant_no")
+            ->selectRaw("COALESCE(m.merchant_name, '') AS merchant_name")
+            ->selectRaw("COALESCE(m.merchant_short_name, '') AS merchant_short_name")
+            ->selectRaw("COALESCE(g.group_name, '') AS merchant_group_name")
+            ->selectRaw("COALESCE(c.name, '') AS channel_name")
+            ->selectRaw("COALESCE(c.plugin_code, '') AS channel_plugin_code");
+    }
+
+}
+

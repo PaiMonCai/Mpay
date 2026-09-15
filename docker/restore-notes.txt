@@ -1,0 +1,8 @@
+Restore outline:
+1. Stop MPAY: docker compose down
+2. Restore data/config, data/runtime, and data/public-storage from mpay-files.tar.gz.
+3. Start only MySQL/Redis: docker compose up -d mysql redis
+4. Import mpay.sql into the configured database.
+5. Start MPAY: docker compose up -d app
+
+Always restore into the same application version first, then run migrations/upgrades.

@@ -1,0 +1,94 @@
+<?php
+
+namespace app\http\mer\controller\system;
+
+use app\common\base\BaseController;
+use app\http\mer\validation\AuthValidator;
+use app\service\merchant\auth\MerchantAuthService;
+use support\limiter\Limiter;
+use support\Request;
+use support\Response;
+
+/**
+ * 商户认证控制器。
+ *
+ * @property MerchantAuthService $merchantAuthService 商户认证服务
+ */
+class AuthController extends BaseController
+{
+    /**
+ * 构造方法。
+     *
+     * @param MerchantAuthService $merchantAuthService 商户认证服务
+     * @return void
+     */
+    public function __construct(
+        protected MerchantAuthService $merchantAuthService
+    ) {
+    }
+
+    /**
+     * 商户登录。
+     *
+     * @param Request $request 请求对象
+     * @return Response 响应对象
+     */
+    public function login(Request $request): Response
+    {
+        $ip = $request->getRealIp();
+        Limiter::check('merchant-login-ip:' . $ip, 10, 60, '登录请求过于频繁，请稍后再试');
+
+        $data = $this->validated($request->all(), AuthValidator::class, 'login');
+        Limiter::check('merchant-login-account:' . md5($ip . ':' . strtolower((string) $data['merchant_no'])), 5, 300, '商户登录尝试过于频繁，请稍后再试');
+
+        return $this->success($this->merchantAuthService->authenticateCredentials(
+            (string) $data['merchant_no'],
+            (string) $data['password'],
+            $request->getRealIp(),
+            $request->header('user-agent', '')
+        ));
+    }
+
+    /**
+     * 商户退出登录。
+     *
+     * @param Request $request 请求对象
+     * @return Response 响应对象
+     */
+    public function logout(Request $request): Response
+    {
+        $token = trim((string) ($request->header('authorization', '') ?: $request->header('x-merchant-token', '')));
+        $token = preg_replace('/^Bearer\s+/i', '', $token) ?: $token;
+
+        if ($token === '') {
+            return $this->success(true);
+        }
+
+        $this->merchantAuthService->revokeToken($token);
+
+        return $this->success(true);
+    }
+
+    /**
+     * 获取当前登录商户信息。
+     *
+     * @param Request $request 请求对象
+     * @return Response 响应对象
+     */
+    public function profile(Request $request): Response
+    {
+        $merchantId = $this->currentMerchantId($request);
+        if ($merchantId <= 0) {
+            return $this->fail('登录上下文异常，请刷新后重试');
+        }
+
+        $merchantNo = $this->currentMerchantNo($request);
+        return $this->success($this->merchantAuthService->profile($merchantId, $merchantNo));
+    }
+}
+
+
+
+
+
+

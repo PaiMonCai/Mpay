@@ -1,0 +1,700 @@
+<?php
+
+namespace app\service\payment\receipt;
+
+use app\common\base\BaseService;
+use support\Redis;
+use Throwable;
+
+/**
+ * 网页流水监听工具运行状态服务。
+ *
+ * 该服务读取 Go 直连与 Python 浏览器 watcher 写入 Redis 的能力心跳，用于管理后台运行监控。
+ * 业务订单同步、流水消费和支付确认仍由 ReceiptWatcherService 与队列消费链路负责。
+ */
+class ReceiptWatcherRuntimeStatusService extends BaseService
+{
+    private const INSTANCES_KEY = 'receipt_watcher_instances';
+    private const INSTANCE_KEY_PREFIX = 'receipt_watcher_instance_';
+    private const HEARTBEAT_MAX_AGE = 60;
+
+    /**
+     * 构造方法。
+     *
+     * @param ReceiptWatcherLicenseService $receiptWatcherLicenseService 网页监听配置服务
+     */
+    public function __construct(
+        protected ReceiptWatcherLicenseService $receiptWatcherLicenseService
+    ) {
+    }
+
+    /**
+     * 获取网页监听工具运行总览。
+     *
+     * @return array<string, mixed>
+     */
+    public function overview(): array
+    {
+        try {
+            return $this->buildOverview();
+        } catch (Throwable $e) {
+            return [
+                'enabled' => $this->watcherEnabled(),
+                'status' => 'failed',
+                'status_text' => '状态读取失败',
+                'summary_value' => '异常',
+                'tone' => 'danger',
+                'message' => $e->getMessage(),
+                'live_instances' => 0,
+                'stale_instances' => 0,
+                'configured_count' => count($this->configuredPluginCodes()),
+                'supported_count' => 0,
+                'missing_count' => 0,
+                'configured_plugins' => $this->configuredPluginCodes(),
+                'missing_plugins' => [],
+                'extra_plugins' => [],
+                'license_blocked_plugins' => [],
+                'license' => $this->receiptWatcherLicenseService->status(),
+                'plugins' => [],
+                'instances' => [],
+            ];
+        }
+    }
+
+    /**
+     * 构建运行总览。
+     *
+     * @return array<string, mixed>
+     */
+    private function buildOverview(): array
+    {
+        $enabled = $this->watcherEnabled();
+        $configuredCodes = $this->configuredPluginCodes();
+        $instances = $this->instances();
+        $liveInstances = array_values(array_filter(
+            $instances,
+            static fn (array $instance): bool => ($instance['status'] ?? '') === 'running'
+        ));
+        $supportedPlugins = $this->supportedPlugins($liveInstances);
+        $supportedCodes = array_column($supportedPlugins, 'code');
+        $license = $this->runtimeLicense($liveInstances);
+        $hasWatcherLicense = $this->hasWatcherLicense($license);
+        $licenseAllowedCodes = $hasWatcherLicense ? array_map('strval', (array) ($license['authorized_plugins'] ?? [])) : [];
+        $licenseBlockedCodes = ($enabled && $hasWatcherLicense) ? array_values(array_diff($configuredCodes, $licenseAllowedCodes)) : [];
+        if ($this->builtinAlipayWatcherEnabled()) {
+            $licenseBlockedCodes = array_values(array_diff($licenseBlockedCodes, ['alipay_bill_receipt']));
+        }
+        $missingCodes = $enabled ? array_values(array_diff(array_diff($configuredCodes, $licenseBlockedCodes), $supportedCodes)) : [];
+        $extraCodes = array_values(array_diff($supportedCodes, $configuredCodes));
+        $status = $this->status($enabled, count($liveInstances), count($configuredCodes), $missingCodes, $licenseBlockedCodes);
+
+        return [
+            'enabled' => $enabled,
+            'status' => $status['status'],
+            'status_text' => $status['status_text'],
+            'summary_value' => $status['summary_value'],
+            'tone' => $status['tone'],
+            'message' => $status['message'],
+            'live_instances' => count($liveInstances),
+            'stale_instances' => count($instances) - count($liveInstances),
+            'configured_count' => count($configuredCodes),
+            'supported_count' => count($supportedPlugins),
+            'missing_count' => count($missingCodes),
+            'configured_plugins' => $configuredCodes,
+            'missing_plugins' => $missingCodes,
+            'extra_plugins' => $extraCodes,
+            'license_blocked_plugins' => $licenseBlockedCodes,
+            'license' => $license,
+            'plugins' => $this->pluginRows($configuredCodes, $supportedPlugins, $enabled, $licenseAllowedCodes, $hasWatcherLicense),
+            'instances' => $instances,
+        ];
+    }
+
+    /**
+     * 读取全部 watcher 运行实例。
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function instances(): array
+    {
+        $ids = Redis::zRange(self::INSTANCES_KEY, 0, -1);
+        if (!is_array($ids) || $ids === []) {
+            return [];
+        }
+
+        $now = time();
+        $rows = [];
+        foreach ($ids as $id) {
+            $instanceId = $this->safeKeyPart((string) $id);
+            $raw = Redis::get(self::INSTANCE_KEY_PREFIX . $instanceId);
+            if (!is_string($raw) || $raw === '') {
+                $rows[] = $this->staleInstance($instanceId);
+                continue;
+            }
+
+            $data = json_decode($raw, true);
+            if (!is_array($data)) {
+                $rows[] = $this->staleInstance($instanceId);
+                continue;
+            }
+
+            $lastSeenAt = (int) ($data['last_seen_at'] ?? 0);
+            $age = $lastSeenAt > 0 ? max(0, $now - $lastSeenAt) : null;
+            $running = $age !== null && $age <= self::HEARTBEAT_MAX_AGE;
+            $plugins = $this->normalizePlugins((array) ($data['plugins'] ?? []), $instanceId);
+
+            $rows[] = [
+                'instance_id' => $instanceId,
+                'hostname' => (string) ($data['hostname'] ?? ''),
+                'pid' => (int) ($data['pid'] ?? 0),
+                'runtime' => (string) ($data['runtime'] ?? 'unknown'),
+                'runtime_text' => $this->runtimeText((string) ($data['runtime'] ?? 'unknown')),
+                'status' => $running ? 'running' : 'timeout',
+                'status_text' => $running ? '在线' : '心跳超时',
+                'tone' => $running ? 'success' : 'warning',
+                'started_at' => (int) ($data['started_at'] ?? 0),
+                'started_at_text' => $this->timestampText((int) ($data['started_at'] ?? 0)),
+                'last_seen_at' => $lastSeenAt,
+                'last_seen_at_text' => $this->timestampText($lastSeenAt),
+                'heartbeat_age_text' => $age === null ? '未上报' : $this->durationText($age) . '前',
+                'worker_index' => (int) ($data['worker_index'] ?? 0),
+                'worker_processes' => (int) ($data['worker_processes'] ?? 0),
+                'worker_text' => $this->workerText(
+                    (int) ($data['worker_index'] ?? 0),
+                    (int) ($data['worker_processes'] ?? 0)
+                ),
+                'stream' => is_array($data['stream'] ?? null) ? $data['stream'] : [],
+                'license' => is_array($data['license'] ?? null) ? $data['license'] : [],
+                'plugin_count' => count($plugins),
+                'plugins_text' => implode('、', array_column($plugins, 'code')),
+                'plugins' => $plugins,
+            ];
+        }
+
+        usort($rows, static function (array $a, array $b): int {
+            return ((int) ($b['last_seen_at'] ?? 0)) <=> ((int) ($a['last_seen_at'] ?? 0));
+        });
+
+        return $rows;
+    }
+
+    /**
+     * 聚合在线 watcher 上报的授权状态。
+     *
+     * @param array<int, array<string, mixed>> $liveInstances 在线实例
+     * @return array<string, mixed> 授权状态
+     */
+    private function runtimeLicense(array $liveInstances): array
+    {
+        $licenses = [];
+        foreach ($liveInstances as $instance) {
+            $license = $instance['license'] ?? null;
+            if (is_array($license) && $license !== []) {
+                $licenses[] = $license;
+            }
+        }
+
+        if ($licenses !== []) {
+            $authorized = [];
+            $free = [];
+            $blocked = [];
+            $statuses = [];
+            foreach ($licenses as $license) {
+                $authorized = array_merge($authorized, array_map('strval', (array) ($license['authorized_plugins'] ?? [])));
+                $free = array_merge($free, array_map('strval', (array) ($license['free_plugin_codes'] ?? [])));
+                $blocked = array_merge($blocked, array_map('strval', (array) ($license['blocked_plugins'] ?? [])));
+                $statuses[] = (string) ($license['status'] ?? 'unknown');
+            }
+            $authorized = array_values(array_unique(array_filter($authorized)));
+            $free = array_values(array_unique(array_filter($free)));
+            $blocked = array_values(array_diff(array_unique(array_filter($blocked)), $authorized));
+            $primary = $licenses[0];
+            $primary['source'] = 'watcher';
+            $primary['runtime_count'] = count($licenses);
+            $primary['runtime_statuses'] = array_values(array_unique($statuses));
+            $primary['authorized_plugins'] = $authorized;
+            $primary['free_plugin_codes'] = $free;
+            $primary['blocked_plugins'] = $blocked;
+            return $primary;
+        }
+
+        $license = $this->receiptWatcherLicenseService->status();
+        $license['source'] = 'webman_config';
+        return $license;
+    }
+
+    /**
+     * 判断授权信息是否来自 watcher 心跳。
+     *
+     * @param array<string, mixed> $license 授权信息
+     * @return bool 是否有 watcher 授权结果
+     */
+    private function hasWatcherLicense(array $license): bool
+    {
+        return (string) ($license['source'] ?? '') === 'watcher'
+            && array_key_exists('authorized_plugins', $license);
+    }
+
+    /**
+     * 构建过期实例行。
+     *
+     * @param string $instanceId 实例标识
+     * @return array<string, mixed>
+     */
+    private function staleInstance(string $instanceId): array
+    {
+        return [
+            'instance_id' => $instanceId,
+            'hostname' => '',
+            'pid' => 0,
+            'runtime' => 'unknown',
+            'runtime_text' => '未知运行时',
+            'status' => 'stale',
+            'status_text' => '已离线',
+            'tone' => 'gray',
+            'started_at' => 0,
+            'started_at_text' => '—',
+            'last_seen_at' => 0,
+            'last_seen_at_text' => '已过期',
+            'heartbeat_age_text' => '已过期',
+            'worker_index' => 0,
+            'worker_processes' => 0,
+            'worker_text' => '—',
+            'stream' => [],
+            'plugin_count' => 0,
+            'plugins_text' => '—',
+            'plugins' => [],
+        ];
+    }
+
+    /**
+     * 聚合在线实例支持的插件。
+     *
+     * @param array<int, array<string, mixed>> $instances 在线实例
+     * @return array<int, array<string, mixed>>
+     */
+    private function supportedPlugins(array $instances): array
+    {
+        $plugins = [];
+        foreach ($instances as $instance) {
+            foreach ((array) ($instance['plugins'] ?? []) as $plugin) {
+                $code = trim((string) ($plugin['code'] ?? ''));
+                if ($code === '') {
+                    continue;
+                }
+
+                if (!isset($plugins[$code])) {
+                    $plugins[$code] = [
+                        'code' => $code,
+                        'name' => (string) ($plugin['name'] ?? $code),
+                        'class' => (string) ($plugin['class'] ?? ''),
+                        'collect_mode_values' => [],
+                        'concurrency_values' => [],
+                        'features' => [],
+                        'instances' => [],
+                    ];
+                }
+
+                $plugins[$code]['instances'][] = (string) ($instance['instance_id'] ?? '');
+                $collectMode = trim((string) ($plugin['collect_mode'] ?? ''));
+                if ($collectMode !== '') {
+                    $plugins[$code]['collect_mode_values'][] = $collectMode;
+                }
+                $plugins[$code]['concurrency_values'][] = (int) ($plugin['concurrency'] ?? 0);
+                foreach ((array) ($plugin['features'] ?? []) as $feature) {
+                    $feature = trim((string) $feature);
+                    if ($feature !== '') {
+                        $plugins[$code]['features'][] = $feature;
+                    }
+                }
+            }
+        }
+
+        foreach ($plugins as &$plugin) {
+            $plugin['instances'] = array_values(array_unique(array_filter($plugin['instances'])));
+            $plugin['features'] = array_values(array_unique($plugin['features']));
+            $plugin['collect_mode_values'] = array_values(array_unique(array_filter($plugin['collect_mode_values'])));
+            $plugin['concurrency_values'] = array_values(array_unique(array_filter($plugin['concurrency_values'])));
+            $plugin['collect_mode'] = (string) ($plugin['collect_mode_values'][0] ?? 'unknown');
+            $plugin['collect_mode_text'] = $plugin['collect_mode_values'] === []
+                ? $this->collectModeText('unknown')
+                : implode(' / ', array_map(fn (string $mode): string => $this->collectModeText($mode), $plugin['collect_mode_values']));
+            $plugin['instance_count'] = count($plugin['instances']);
+            $plugin['concurrency_text'] = $plugin['concurrency_values'] === []
+                ? '—'
+                : implode(' / ', array_map('strval', $plugin['concurrency_values']));
+            $plugin['features_text'] = $this->featuresText($plugin['features']);
+        }
+        unset($plugin);
+
+        return array_values($plugins);
+    }
+
+    /**
+     * 构建插件对照表。
+     *
+     * @param array<int, string> $configuredCodes 后台配置插件
+     * @param array<int, array<string, mixed>> $supportedPlugins watcher 支持插件
+     * @param bool $enabled 总开关是否开启
+     * @param array<int, string> $licenseAllowedCodes watcher 授权允许插件
+     * @param bool $hasWatcherLicense 是否已有 watcher 授权结果
+     * @return array<int, array<string, mixed>>
+     */
+    private function pluginRows(
+        array $configuredCodes,
+        array $supportedPlugins,
+        bool $enabled,
+        array $licenseAllowedCodes,
+        bool $hasWatcherLicense
+    ): array
+    {
+        $supportedByCode = [];
+        foreach ($supportedPlugins as $plugin) {
+            $supportedByCode[(string) $plugin['code']] = $plugin;
+        }
+
+        $licenseAllowedByCode = array_fill_keys($licenseAllowedCodes, true);
+        $codes = array_values(array_unique(array_merge($configuredCodes, array_keys($supportedByCode))));
+        $rows = [];
+        foreach ($codes as $code) {
+            $configured = in_array($code, $configuredCodes, true);
+            $supported = isset($supportedByCode[$code]);
+            $builtinAlipay = $code === 'alipay_bill_receipt' && $this->builtinAlipayWatcherEnabled();
+            $licenseAllowed = $builtinAlipay || !$hasWatcherLicense || isset($licenseAllowedByCode[$code]);
+            $plugin = $supportedByCode[$code] ?? ['code' => $code, 'name' => $code];
+            $status = $this->pluginStatus($enabled, $configured, $supported, $licenseAllowed, $hasWatcherLicense);
+
+            $rows[] = array_merge($plugin, [
+                'code' => $code,
+                'configured' => $configured,
+                'configured_text' => $configured ? ($enabled ? '已启用' : '已配置') : '未配置',
+                'license_allowed' => $licenseAllowed,
+                'license_allowed_text' => $builtinAlipay
+                    ? '内置 OpenAPI'
+                    : ($hasWatcherLicense ? ($licenseAllowed ? '授权允许' : '授权未允许') : '等待心跳'),
+                'supported' => $supported,
+                'supported_text' => $supported ? '已支持' : '未上报',
+                'status' => $status['status'],
+                'status_text' => $status['status_text'],
+                'tone' => $status['tone'],
+            ]);
+        }
+
+        return $rows;
+    }
+
+    /**
+     * 归一化实例上报插件。
+     *
+     * @param array<int, mixed> $plugins 原始插件列表
+     * @param string $instanceId 实例标识
+     * @return array<int, array<string, mixed>>
+     */
+    private function normalizePlugins(array $plugins, string $instanceId): array
+    {
+        $rows = [];
+        foreach ($plugins as $plugin) {
+            if (!is_array($plugin)) {
+                continue;
+            }
+
+            $code = trim((string) ($plugin['code'] ?? ''));
+            if ($code === '') {
+                continue;
+            }
+
+            $features = [];
+            foreach ((array) ($plugin['features'] ?? []) as $feature) {
+                $feature = trim((string) $feature);
+                if ($feature !== '') {
+                    $features[] = $feature;
+                }
+            }
+
+            $rows[] = [
+                'code' => $code,
+                'name' => (string) ($plugin['name'] ?? $code),
+                'class' => (string) ($plugin['class'] ?? ''),
+                'collect_mode' => (string) ($plugin['collect_mode'] ?? 'unknown'),
+                'collect_mode_text' => $this->collectModeText((string) ($plugin['collect_mode'] ?? 'unknown')),
+                'concurrency' => (int) ($plugin['concurrency'] ?? 0),
+                'features' => array_values(array_unique($features)),
+                'features_text' => $this->featuresText($features),
+                'status' => (string) ($plugin['status'] ?? 'available'),
+                'instance_id' => $instanceId,
+            ];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * 运行状态。
+     *
+     * @param bool $enabled 是否启用
+     * @param int $liveInstances 在线实例数
+     * @param int $configuredCount 已配置插件数
+     * @param array<int, string> $missingCodes 缺失插件
+     * @param array<int, string> $licenseBlockedCodes watcher 授权未允许插件
+     * @return array<string, string>
+     */
+    private function status(bool $enabled, int $liveInstances, int $configuredCount, array $missingCodes, array $licenseBlockedCodes): array
+    {
+        if (!$enabled) {
+            return [
+                'status' => 'disabled',
+                'status_text' => '未启用',
+                'summary_value' => '关闭',
+                'tone' => 'gray',
+                'message' => '系统配置未开启网页流水监听。',
+            ];
+        }
+
+        if ($configuredCount <= 0) {
+            return [
+                'status' => 'empty_config',
+                'status_text' => '未配置插件',
+                'summary_value' => '未配置',
+                'tone' => 'warning',
+                'message' => '网页流水监听已开启，但系统配置中没有填写支持插件标识。',
+            ];
+        }
+
+        if ($liveInstances <= 0) {
+            return [
+                'status' => 'offline',
+                'status_text' => '监听工具未上报',
+                'summary_value' => '离线',
+                'tone' => 'warning',
+                'message' => 'Webman 已启用网页流水监听，但 Go 直连和 Python 浏览器 watcher 均未上报能力心跳。',
+            ];
+        }
+
+        if ($licenseBlockedCodes !== []) {
+            return [
+                'status' => 'license_blocked_plugin',
+                'status_text' => '部分插件未授权',
+                'summary_value' => '未授权 ' . count($licenseBlockedCodes),
+                'tone' => 'danger',
+                'message' => 'watcher 授权未允许后台配置的插件：' . implode('、', $licenseBlockedCodes),
+            ];
+        }
+
+        if ($missingCodes !== []) {
+            return [
+                'status' => 'missing_plugin',
+                'status_text' => '部分插件未支持',
+                'summary_value' => '缺失 ' . count($missingCodes),
+                'tone' => 'warning',
+                'message' => '后台配置的插件未在对应 watcher 运行时中上报支持：' . implode('、', $missingCodes),
+            ];
+        }
+
+        return [
+            'status' => 'running',
+            'status_text' => '能力正常',
+            'summary_value' => '正常',
+            'tone' => 'success',
+            'message' => '已存在在线 watcher，并上报了所需监听能力。',
+        ];
+    }
+
+    /**
+     * watcher 运行时编码转展示文案。
+     *
+     * @param string $runtime 运行时编码
+     * @return string 展示文案
+     */
+    private function runtimeText(string $runtime): string
+    {
+        return match ($runtime) {
+            'go-direct' => 'Go 直连',
+            'python-browser' => 'Python 浏览器',
+            'php-builtin' => 'PHP 内置 OpenAPI',
+            default => $runtime !== '' ? $runtime : '未知运行时',
+        };
+    }
+
+    /**
+     * 插件行状态。
+     *
+     * @param bool $enabled 总开关是否启用
+     * @param bool $configured 插件是否配置
+     * @param bool $supported watcher 是否支持
+     * @param bool $licenseAllowed watcher 授权是否允许
+     * @param bool $hasWatcherLicense 是否已有 watcher 授权结果
+     * @return array<string, string>
+     */
+    private function pluginStatus(bool $enabled, bool $configured, bool $supported, bool $licenseAllowed, bool $hasWatcherLicense): array
+    {
+        if (!$enabled) {
+            return ['status' => 'disabled', 'status_text' => '总开关关闭', 'tone' => 'gray'];
+        }
+        if ($configured && $hasWatcherLicense && !$licenseAllowed) {
+            return ['status' => 'license_blocked', 'status_text' => '授权未允许', 'tone' => 'danger'];
+        }
+        if ($configured && $supported) {
+            return ['status' => 'ok', 'status_text' => '可用', 'tone' => 'success'];
+        }
+        if ($configured) {
+            return ['status' => 'missing', 'status_text' => '监听工具未支持', 'tone' => 'warning'];
+        }
+
+        return ['status' => 'extra', 'status_text' => '未启用', 'tone' => 'gray'];
+    }
+
+    /**
+     * 获取后台配置的网页监听插件编码。
+     *
+     * @return array<int, string>
+     */
+    private function configuredPluginCodes(): array
+    {
+        $raw = (string) sys_config('receipt_watcher_plugin_codes', '');
+        $parts = preg_split('/[\s,，;；]+/', $raw) ?: [];
+        $codes = [];
+        foreach ($parts as $part) {
+            $code = trim((string) $part);
+            if ($code !== '') {
+                $codes[] = $code;
+            }
+        }
+
+        if ($this->builtinAlipayWatcherEnabled()) {
+            $codes[] = 'alipay_bill_receipt';
+        }
+
+        return array_values(array_unique($codes));
+    }
+
+    /**
+     * 判断内置支付宝账单 OpenAPI watcher 是否启用。
+     */
+    private function builtinAlipayWatcherEnabled(): bool
+    {
+        $value = strtolower(trim((string) sys_config('receipt_watcher_builtin_alipay_enabled', '0')));
+
+        return in_array($value, ['1', 'true', 'yes', 'on', 'enabled'], true);
+    }
+
+    /**
+     * 判断网页流水监听总开关是否开启。
+     *
+     * @return bool 是否启用
+     */
+    private function watcherEnabled(): bool
+    {
+        $value = strtolower(trim((string) sys_config('receipt_watcher_enabled', '0')));
+
+        return in_array($value, ['1', 'true', 'yes', 'on', 'enabled'], true);
+    }
+
+    /**
+     * 能力标识转展示文案。
+     *
+     * @param array<int, string> $features 能力标识
+     * @return string 展示文案
+     */
+    private function featuresText(array $features): string
+    {
+        $map = [
+            'amount_only' => '仅金额',
+            'captcha' => '验证码',
+            'iframe' => 'Iframe',
+            'multi_merchant' => '多商户',
+            'rsa2' => 'RSA2',
+            'signed_api' => '签名接口',
+            'slide_captcha' => '滑块',
+            'table_parse' => '表格解析',
+            'token_refresh' => 'Token 刷新',
+        ];
+        $texts = [];
+        foreach (array_values(array_unique($features)) as $feature) {
+            $texts[] = $map[$feature] ?? $feature;
+        }
+
+        return $texts === [] ? '—' : implode('、', $texts);
+    }
+
+    /**
+     * 采集方式标识转展示文案。
+     *
+     * @param string $mode 采集方式
+     * @return string 展示文案
+     */
+    private function collectModeText(string $mode): string
+    {
+        return match ($mode) {
+            'direct_api' => '接口直连',
+            'browser_api' => '浏览器接口',
+            'browser_dom' => '页面解析',
+            'browser_special' => '特殊页面',
+            default => $mode !== '' ? $mode : '未知',
+        };
+    }
+
+    /**
+     * 格式化当前进程在容器 worker 组中的序号。
+     *
+     * watcher 内部从 0 开始编号，管理后台按用户习惯从 1 开始展示。
+     * 旧心跳没有总进程数时只展示当前序号，避免伪造一个不准确的总数。
+     *
+     * @param int $workerIndex 从 0 开始的 worker 编号
+     * @param int $workerProcesses 当前容器配置的总 worker 数
+     * @return string Worker 展示文本
+     */
+    private function workerText(int $workerIndex, int $workerProcesses): string
+    {
+        $current = max(0, $workerIndex) + 1;
+
+        return $workerProcesses > 0
+            ? $current . ' / ' . max($current, $workerProcesses)
+            : '#' . $current;
+    }
+
+    /**
+     * 时间戳展示文本。
+     *
+     * @param int $timestamp 时间戳
+     * @return string 展示文本
+     */
+    private function timestampText(int $timestamp): string
+    {
+        return $timestamp > 0 ? date('Y-m-d H:i:s', $timestamp) : '—';
+    }
+
+    /**
+     * 秒数转中文时长。
+     *
+     * @param int $seconds 秒数
+     * @return string 时长文本
+     */
+    private function durationText(int $seconds): string
+    {
+        $seconds = max(0, $seconds);
+        if ($seconds < 60) {
+            return $seconds . ' 秒';
+        }
+        if ($seconds < 3600) {
+            return floor($seconds / 60) . ' 分钟';
+        }
+        if ($seconds < 86400) {
+            return floor($seconds / 3600) . ' 小时 ' . floor(($seconds % 3600) / 60) . ' 分钟';
+        }
+
+        return floor($seconds / 86400) . ' 天 ' . floor(($seconds % 86400) / 3600) . ' 小时';
+    }
+
+    /**
+     * Redis Key 安全片段。
+     *
+     * @param string $value 原始值
+     * @return string 安全片段
+     */
+    private function safeKeyPart(string $value): string
+    {
+        $safe = preg_replace('/[^A-Za-z0-9_\\-]/', '_', $value) ?? '';
+
+        return trim($safe, '_') !== '' ? trim($safe, '_') : 'empty';
+    }
+}

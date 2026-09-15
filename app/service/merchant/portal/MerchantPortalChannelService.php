@@ -1,0 +1,170 @@
+<?php
+
+namespace app\service\merchant\portal;
+
+use app\common\base\BaseService;
+use app\service\payment\config\PaymentChannelTestService;
+
+/**
+ * 商户门户通道服务。
+ *
+ * @property MerchantPortalChannelQueryService $queryService 查询服务
+ * @property MerchantPortalChannelCommandService $commandService 命令服务
+ * @property MerchantPortalRoutePreviewService $routePreviewService 路由解析服务
+ * @property MerchantPortalRouteConfigService $routeConfigService 路由偏好配置服务
+ * @property PaymentChannelTestService $channelTestService 通道测试服务
+ */
+class MerchantPortalChannelService extends BaseService
+{
+    /**
+     * 构造方法。
+     *
+     * @param MerchantPortalChannelQueryService $queryService 查询服务
+     * @param MerchantPortalChannelCommandService $commandService 命令服务
+     * @param MerchantPortalRoutePreviewService $routePreviewService 路由解析服务
+     * @param MerchantPortalRouteConfigService $routeConfigService 路由偏好配置服务
+     * @param PaymentChannelTestService $channelTestService 通道测试服务
+     */
+    public function __construct(
+        protected MerchantPortalChannelQueryService $queryService,
+        protected MerchantPortalChannelCommandService $commandService,
+        protected MerchantPortalRoutePreviewService $routePreviewService,
+        protected MerchantPortalRouteConfigService $routeConfigService,
+        protected PaymentChannelTestService $channelTestService
+    ) {
+    }
+
+    /**
+     * 查询当前商户已开通的渠道。
+     *
+     * @param array $filters 筛选条件
+     * @param int $merchantId 商户ID
+     * @param int $page 页码
+     * @param int $pageSize 每页条数
+     * @return array 渠道列表数据
+     */
+    public function myChannels(array $filters, int $merchantId, int $page, int $pageSize): array
+    {
+        return $this->queryService->myChannels($filters, $merchantId, $page, $pageSize);
+    }
+
+    /**
+     * 获取商户渠道路由解析结果。
+     *
+     * @param int $merchantId 商户ID
+     * @param int $payTypeId 支付类型ID
+     * @param int $payAmount 支付金额
+     * @param string $statDate 统计日期
+     * @return array 路由解析数据
+     */
+    public function routePreview(int $merchantId, int $payTypeId, int $payAmount, string $statDate = ''): array
+    {
+        return $this->routePreviewService->routePreview($merchantId, $payTypeId, $payAmount, $statDate);
+    }
+
+    /**
+     * 查询商户路由偏好配置。
+     *
+     * @param int $merchantId 商户ID
+     * @return array 配置数据
+     */
+    public function routeConfig(int $merchantId): array
+    {
+        return $this->routeConfigService->settings($merchantId);
+    }
+
+    /**
+     * 保存商户路由偏好配置。
+     *
+     * @param int $merchantId 商户ID
+     * @param array $payload 配置数据
+     * @return array 保存后的配置
+     */
+    public function saveRouteConfig(int $merchantId, array $payload): array
+    {
+        return $this->routeConfigService->save($merchantId, $payload);
+    }
+
+    public function createMeta(): array
+    {
+        return $this->commandService->createMeta();
+    }
+
+    public function pluginConfigs(array $filters, int $merchantId, int $page, int $pageSize): array
+    {
+        return $this->commandService->pluginConfigs($filters, $merchantId, $page, $pageSize);
+    }
+
+    public function pluginConfigDetail(int $merchantId, int $id)
+    {
+        return $this->commandService->pluginConfigDetail($merchantId, $id);
+    }
+
+    public function createPluginConfig(int $merchantId, array $data)
+    {
+        return $this->commandService->createPluginConfig($merchantId, $data);
+    }
+
+    public function updatePluginConfig(int $merchantId, int $id, array $data)
+    {
+        return $this->commandService->updatePluginConfig($merchantId, $id, $data);
+    }
+
+    public function deletePluginConfig(int $merchantId, int $id): bool
+    {
+        return $this->commandService->deletePluginConfig($merchantId, $id);
+    }
+
+    public function pluginConfigOptions(int $merchantId, string $pluginCode = ''): array
+    {
+        return $this->commandService->pluginConfigOptions($merchantId, $pluginCode);
+    }
+
+    public function createChannel(int $merchantId, array $data)
+    {
+        return $this->commandService->createChannel($merchantId, $data);
+    }
+
+    public function updateChannel(int $merchantId, int $id, array $data)
+    {
+        return $this->commandService->updateChannel($merchantId, $id, $data);
+    }
+
+    public function deleteChannel(int $merchantId, int $id): bool
+    {
+        return $this->commandService->deleteChannel($merchantId, $id);
+    }
+
+    /**
+     * 发起商户自建通道测试支付。
+     *
+     * @param int $merchantId 当前商户ID
+     * @param int $channelId 通道ID
+     * @param array $data 测试入参
+     * @return array 测试订单与支付页信息
+     */
+    public function testChannel(int $merchantId, int $channelId, array $data): array
+    {
+        return $this->channelTestService->submitForMerchant($merchantId, $channelId, $data);
+    }
+
+    /**
+     * 查询商户自建通道测试记录。
+     *
+     * @param int $merchantId 当前商户ID
+     * @param int $channelId 通道ID
+     * @param array $filters 筛选条件
+     * @param int $page 页码
+     * @param int $pageSize 每页条数
+     * @return \Illuminate\Contracts\Pagination\LengthAwarePaginator 分页结果
+     */
+    public function channelTestRecords(int $merchantId, int $channelId, array $filters, int $page, int $pageSize)
+    {
+        return $this->channelTestService->merchantRecords($merchantId, $channelId, $filters, $page, $pageSize);
+    }
+
+    public function pluginSchema(string $pluginCode): array
+    {
+        return $this->commandService->pluginSchema($pluginCode);
+    }
+}

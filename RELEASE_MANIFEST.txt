@@ -1,0 +1,37 @@
+MPAY Docker + Built-in Alipay OpenAPI Watcher
+=============================================
+
+Runtime stack:
+- PHP 8.2 CLI / Webman 2.x
+- MySQL 8.0
+- Redis 7
+- Built-in Alipay OpenAPI bill watcher
+
+Docker additions:
+- Dockerfile
+- docker-compose.yml
+- docker/docker-entrypoint.sh
+- docker/setup.sh
+- docker/backup.sh
+- .env.docker.example
+- .dockerignore
+- .github/workflows/docker-build.yml
+- DOCKER_DEPLOY.md
+- GITHUB_UPLOAD.md
+
+Persistence:
+- data/config: application env + ePay RSA keys
+- data/runtime: install lock, logs, private storage
+- data/public-storage: public uploads
+- data/mysql: MySQL data
+- data/redis: Redis data
+
+Validation performed in packaging environment:
+- PHP syntax lint: 602 application/config/database/support files passed
+- docker-compose.yml YAML parse passed
+- GitHub Actions workflow YAML parse passed
+- shell syntax checks passed for Docker helper scripts
+
+Note: Docker Engine is not available in the packaging environment, so an actual
+container image build could not be executed here. GitHub Actions in this repo
+will perform a real Docker build after push.
