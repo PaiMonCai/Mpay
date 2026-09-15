@@ -26,18 +26,13 @@ RUN apt-get update \
     && docker-php-ext-install -j"$(nproc)" \
         bcmath \
         curl \
-        dom \
         gd \
         mbstring \
         opcache \
         pcntl \
         pdo_mysql \
         posix \
-        simplexml \
         sockets \
-        xml \
-        xmlreader \
-        xmlwriter \
         zip \
     && pecl install redis \
     && docker-php-ext-enable redis \
