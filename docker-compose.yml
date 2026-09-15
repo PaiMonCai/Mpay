@@ -7,6 +7,7 @@ services:
       dockerfile: Dockerfile
       args:
         COMPOSER_REPO: ${COMPOSER_REPO:-}
+        APT_MIRROR: ${APT_MIRROR:-}
     image: ${MPAY_IMAGE:-mpay-local:latest}
     container_name: mpay-app
     restart: unless-stopped

@@ -1,5 +1,8 @@
 FROM php:8.2-cli-bookworm
 
+# 国内构建可传 APT_MIRROR=mirrors.tuna.tsinghua.edu.cn（或 mirrors.aliyun.com）加速 apt。
+ARG APT_MIRROR=
+
 LABEL org.opencontainers.image.title="MPAY"
 LABEL org.opencontainers.image.description="MPAY Webman payment gateway with built-in Alipay OpenAPI bill watcher"
 
@@ -8,7 +11,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     COMPOSER_ALLOW_SUPERUSER=1 \
     EPAY_PLATFORM_KEY_DIR=/data/config
 
-RUN apt-get update \
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s@deb\.debian\.org@${APT_MIRROR}@g" /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \

@@ -42,6 +42,29 @@ docker/setup.sh
 docker compose up -d --build
 ```
 
+**国内服务器：使用 GHCR 预构建镜像（推荐）**
+
+推送到 main 分支时 GitHub Actions 会自动构建并推送镜像到 `ghcr.io`。国内服务器可以跳过本地构建，直接拉取预构建镜像（`ghcr.nju.edu.cn` 是 GHCR 的国内镜像站）：
+
+```bash
+# .env 中设置
+MPAY_IMAGE=ghcr.nju.edu.cn/paimoncai/mpay-pro:latest
+
+docker compose pull app
+docker compose up -d
+```
+
+之后更新代码时以 `docker compose pull app && docker compose up -d` 代替重新构建。
+仓库为私有时需先在服务器上 `docker login ghcr.io`（使用 read:packages 权限的 PAT），或将 GHCR 包设为 public；镜像站只能加速公开镜像。
+
+本地构建太慢时，还可以测速并自动选择最快的 Docker Hub 加速器：
+
+```bash
+sudo bash docker/mirror-speedtest.sh
+```
+
+构建期的 apt / composer 慢可在 `.env` 中设置 `APT_MIRROR` 和 `COMPOSER_REPO`（见 `.env.docker.example`）。
+
 检查状态：
 
 ```bash
